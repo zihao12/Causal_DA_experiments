@@ -88,91 +88,14 @@ def eval_model(model, device, test_loader, set_name="test set"):
   return acc
 
 
-def erm_train(model, device, train_loader, optimizer, epoch):
-  model.train()
-  penalty_irm = 0
-  for batch_idx, (data, target) in enumerate(train_loader):
-    data, target = data.to(device), target.to(device).float()
-    dummy_w = torch.nn.Parameter(torch.Tensor([1.0])).to(device)
-    optimizer.zero_grad()
-    output = model(data)
-    #loss = F.binary_cross_entropy_with_logits(output, target)
-    loss_erm = F.binary_cross_entropy_with_logits(output * dummy_w, target, reduction='none')
-    penalty_irm += compute_irm_penalty(loss_erm, dummy_w, None).item()
-
-    loss = loss_erm.mean()
-    loss.backward()
-    optimizer.step()
-    if batch_idx % 10 == 0:
-      print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-        epoch, batch_idx * len(data), len(train_loader.dataset),
-               100. * batch_idx / len(train_loader), loss.item()))
-
-  return penalty_irm
-
-
-def train_and_test_erm(maxiter, out_result_name, out_model_name):
-  use_cuda = torch.cuda.is_available()
-  device = torch.device("cuda" if use_cuda else "cpu")
-
-  kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
-
-  data_train = ColoredMNIST(root='./data', env='all_train',
-                 transform=transforms.Compose([
-                     transforms.ToTensor(),
-                     transforms.Normalize((0.1307, 0.1307, 0.), (0.3081, 0.3081, 0.3081))
-                   ]))
-
-  complete_data_loader = torch.utils.data.DataLoader(data_train,
-    batch_size=2000, shuffle=False, **kwargs)
-
-
-  all_train_loader = torch.utils.data.DataLoader(data_train,
-    batch_size=2000, shuffle=True, **kwargs)
-
-  test_loader = torch.utils.data.DataLoader(
-    ColoredMNIST(root='./data', env='test', transform=transforms.Compose([
-      transforms.ToTensor(),
-      transforms.Normalize((0.1307, 0.1307, 0.), (0.3081, 0.3081, 0.3081))
-    ])),
-    batch_size=2000, shuffle=False, **kwargs)
-
-  model = ConvNet().to(device)
-  optimizer = optim.Adam(model.parameters(), lr=0.01)
-
-
-  train_accs = []
-  test_accs = []
-  penalties_irm = []
-  for epoch in range(1, maxiter + 1): 
-    penalties_irm_tmp = erm_train(model, device, all_train_loader, optimizer, epoch)
-    train_acc = test_model(model, device, all_train_loader, set_name='train set')
-    test_acc = test_model(model, device, test_loader)
-
-    train_accs.append(train_acc)
-    test_accs.append(test_acc)
-    penalties_irm.append(penalties_irm_tmp)
-
-
-  out = {}
-  out['train_acc'] = train_accs
-  out['test_acc'] = test_accs
-  out['penalties_irm'] = penalties_irm
-  with open(out_result_name, 'wb') as f:
-    pickle.dump(out, f)
-  torch.save(model, out_model_name)
-
-
 def compute_irm_penalty(losses, dummy, weights):
   if weights is None:
-    g1 = grad(losses[0::2].mean(), dummy, create_graph=True)[0]
-    g2 = grad(losses[1::2].mean(), dummy, create_graph=True)[0]
+    g = grad(losses.mean(), dummy, create_graph=True)[0]
   else:
-    g1 = grad((weights * losses)[0::2].mean(), dummy, create_graph=True)[0]
-    g2 = grad((weights * losses)[1::2].mean(), dummy, create_graph=True)[0]
-  return (g1 * g2).sum()
+    g = grad((weights * losses).mean(), dummy, create_graph=True)[0]
+  return (g ** 2).sum()
 
-def irm_train(model, device, train_loaders, optimizer, epoch, generalized):
+def irm_train(model, device, train_loaders, optimizer, epoch, penalty_weight, penalty_anneal_iters, generalized):
   model.train()
 
   #pdb.set_trace()
@@ -184,8 +107,6 @@ def irm_train(model, device, train_loaders, optimizer, epoch, generalized):
   dummy_w = torch.nn.Parameter(torch.Tensor([1.0])).to(device)
 
   batch_idx = 0
-  penalty_multiplier = epoch ** 2
-  print(f'Using penalty multiplier {penalty_multiplier}')
   while True:
     optimizer.zero_grad()
     error = 0
@@ -216,8 +137,11 @@ def irm_train(model, device, train_loaders, optimizer, epoch, generalized):
       penalties_irm[d] += penalty_irm.item()      
 
       error += loss_erm.mean()
+
+    penalty_weight = (penalty_weight if epoch >= penalty_anneal_iters else 1.0) 
+    print(f"penalty weight {penalty_weight}")
     
-    (error + penalty_multiplier * penalty).backward()
+    (error + penalty_weight * penalty).backward()
     optimizer.step()
     if batch_idx % 2 == 0:
       print('Train Epoch: {} [{}/{} ({:.0f}%)]\tERM loss: {:.6f}\tGrad penalty: {:.6f}'.format(
@@ -227,11 +151,8 @@ def irm_train(model, device, train_loaders, optimizer, epoch, generalized):
 
     batch_idx += 1
 
-  
-    
 
-
-def train_and_test_irm(maxiter, out_result_name, out_model_name, generalized):
+def train_and_test_irm(maxiter, out_result_name, out_model_name, penalty_weight, penalty_anneal_iters, generalized):
   use_cuda = torch.cuda.is_available()
   device = torch.device("cuda" if use_cuda else "cpu")
 
@@ -281,7 +202,7 @@ def train_and_test_irm(maxiter, out_result_name, out_model_name, generalized):
   penalties_girm = []
 
   for epoch in range(1, maxiter + 1):
-    penalties_irm_tmp, penalties_girm_tmp = irm_train(model, device, [train1_loader, train2_loader], optimizer, epoch, generalized)    
+    penalties_irm_tmp, penalties_girm_tmp = irm_train(model, device, [train1_loader, train2_loader], optimizer, epoch, penalty_weight, penalty_anneal_iters, generalized)    
     train1_acc = test_model(model, device, train1_loader, set_name='train1 set')
     train2_acc = test_model(model, device, train2_loader, set_name='train2 set')
     test_acc = test_model(model, device, test_loader)
@@ -324,13 +245,13 @@ def plot_dataset_digits(dataset):
   plt.show()  # finally, render the plot
 
 
-def main(method, maxiter, out_result_name, out_model_name):
+def main(method, maxiter, out_result_name, out_model_name, penalty_weight, penalty_anneal_iters):
   if method == 'irm':
-    train_and_test_irm(maxiter, out_result_name, out_model_name, False)
+    train_and_test_irm(maxiter, out_result_name, out_model_name, penalty_weight, penalty_anneal_iters, False)
   if method == 'girm':
-    train_and_test_irm(maxiter, out_result_name, out_model_name, True)
+    train_and_test_irm(maxiter, out_result_name, out_model_name, penalty_weight, penalty_anneal_iters, True)
   if method == 'erm':
-    train_and_test_erm(maxiter, out_result_name, out_model_name)
+    train_and_test_irm(maxiter, out_result_name, out_model_name, 0, 0, False)
 
 
 if __name__ == '__main__':
@@ -341,6 +262,8 @@ if __name__ == '__main__':
   parser.add_argument('--maxiter', type=int, default=1,  help='method')
   parser.add_argument('--out_result', type=str,  default="test.pkl", help='out_result')
   parser.add_argument('--out_model', type=str,  default="test.pt", help='out_model')
+  parser.add_argument('--penalty_anneal_iters', type=int, default=100)
+  parser.add_argument('--penalty_weight', type=float, default=10000.0)
   args = parser.parse_args()
 
   method = args.method
@@ -349,6 +272,8 @@ if __name__ == '__main__':
   i = args.i
   out_result_name = args.out_result
   out_model_name = args.out_model
+  penalty_anneal_iters = args.penalty_anneal_iters
+  penalty_weight = args.penalty_weight
 
   torch.manual_seed(i)
-  main(method, maxiter, out_result_name, out_model_name)
+  main(method, maxiter, out_result_name, out_model_name, penalty_weight, penalty_anneal_iters)
